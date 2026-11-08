@@ -1,0 +1,8 @@
+/target
+clipvault-data/
+clipvault.db
+*.db
+*.db-wal
+*.db-shm
+export.json
+.DS_Store
