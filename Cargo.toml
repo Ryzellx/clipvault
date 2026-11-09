@@ -1,6 +1,6 @@
 [package]
 name = "clipvault"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Privacy-first offline clipboard history manager for Windows and Linux"
@@ -35,7 +35,8 @@ png = "0.17"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_DataExchange", "Win32_UI_WindowsAndMessaging"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

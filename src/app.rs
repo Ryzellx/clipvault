@@ -51,12 +51,12 @@ pub struct ClipVaultApp {
     history_filter: String,
     tag_input: String,
     selected_id: Option<i64>,
-    toast: Option<(String, ToastKind, f64)>,
+    toast: Option<(String, ToastKind, std::time::Instant)>,
     export_path: String,
     import_path: String,
     snippet_text: String,
     snippet_tag: String,
-    page_anim: f32,
+    page_started: std::time::Instant,
     confirm_clear: bool,
 }
 
@@ -77,13 +77,35 @@ impl ClipVaultApp {
             import_path: String::new(),
             snippet_text: String::new(),
             snippet_tag: String::new(),
-            page_anim: 0.0,
+            page_started: std::time::Instant::now(),
             confirm_clear: false,
         }
     }
 
     fn set_toast(&mut self, text: impl Into<String>, kind: ToastKind) {
-        self.toast = Some((text.into(), kind, crate::now_unix() as f64));
+        self.toast = Some((text.into(), kind, std::time::Instant::now()));
+    }
+
+    /// Opacity of the current page's content: fades in over 180ms after a
+    /// page switch, instant with reduced motion.
+    fn page_fade(&self) -> f32 {
+        crate::animation::page_fade(
+            self.page_started.elapsed().as_secs_f32(),
+            0.18,
+            self.settings.reduced_motion,
+        )
+    }
+
+    fn nav_icon(page: Page) -> &'static str {
+        match page {
+            Page::Dashboard => "▦",
+            Page::History => "↺",
+            Page::Favorites => "★",
+            Page::Snippets => "✎",
+            Page::Search => "⌕",
+            Page::Activity => "◷",
+            Page::Settings => "⚙",
+        }
     }
 
     fn save_settings(&mut self) {
@@ -95,33 +117,41 @@ impl ClipVaultApp {
 
 impl eframe::App for ClipVaultApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let dt = ctx.input(|i| i.stable_dt).min(0.05);
-        let target = 1.0f32;
-        let speed = if self.settings.reduced_motion {
-            100.0
-        } else {
-            8.0
-        };
-        self.page_anim += (target - self.page_anim) * (dt * speed).min(1.0);
-
         let p = ui::palette();
+        let reduced = self.settings.reduced_motion;
+        let sidebar_target = if self.sidebar_collapsed { 60.0 } else { 208.0 };
+        let sidebar_width =
+            crate::animation::animate_to(ctx, "sidebar-width", sidebar_target, 0.22, reduced);
+        let fade = self.page_fade();
+
         egui::SidePanel::left("sidebar")
             .resizable(false)
-            .exact_width(if self.sidebar_collapsed { 56.0 } else { 200.0 })
+            .exact_width(sidebar_width)
             .show(ctx, |ui| {
-                ui.add_space(12.0);
+                ui::paint_gradient_background(ui);
+                ui.add_space(14.0);
                 if self.sidebar_collapsed {
-                    ui.heading("CV");
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("CV")
+                                .font(ui::heading_font(20.0))
+                                .color(p.accent),
+                        );
+                    });
                 } else {
-                    ui.heading("ClipVault");
-                    ui.label("Clipboard history, kept private.");
+                    ui.label(egui::RichText::new("ClipVault").font(ui::heading_font(22.0)));
+                    ui.label(
+                        egui::RichText::new("Clipboard history, kept private.")
+                            .small()
+                            .color(p.text_dim),
+                    );
                 }
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 if ui
                     .button(if self.sidebar_collapsed {
-                        ">"
+                        "›"
                     } else {
-                        "< Collapse"
+                        "‹ Collapse"
                     })
                     .clicked()
                 {
@@ -129,28 +159,30 @@ impl eframe::App for ClipVaultApp {
                 }
                 ui.add_space(12.0);
                 ui.separator();
+                ui.add_space(6.0);
                 for page in PAGES {
-                    let selected = self.page == page;
-                    let label = if self.sidebar_collapsed {
-                        page.label().chars().next().unwrap_or('?').to_string()
-                    } else {
-                        page.label().to_string()
-                    };
-                    let btn = egui::Button::new(label)
-                        .selected(selected)
-                        .min_size(egui::vec2(0.0, 32.0));
-                    if ui.add(btn).clicked() {
+                    if ui::nav_button(
+                        ui,
+                        Self::nav_icon(page),
+                        page.label(),
+                        self.page == page,
+                        self.sidebar_collapsed,
+                    )
+                    .clicked()
+                    {
                         self.page = page;
-                        self.page_anim = 0.0;
+                        self.page_started = std::time::Instant::now();
                     }
+                    ui.add_space(2.0);
                 }
                 ui.add_space(16.0);
                 ui.separator();
+                ui.add_space(8.0);
                 let paused = PAUSED.load(Ordering::Relaxed);
                 let pause_label = if paused {
-                    "Resume monitoring"
+                    "▶ Resume monitoring"
                 } else {
-                    "Pause monitoring"
+                    "❚❚ Pause monitoring"
                 };
                 if ui.button(pause_label).clicked() {
                     PAUSED.store(!paused, Ordering::Relaxed);
@@ -173,30 +205,89 @@ impl eframe::App for ClipVaultApp {
                 }
                 if !self.sidebar_collapsed {
                     ui.add_space(8.0);
-                    ui.colored_label(p.text_dim, if paused { "Paused" } else { "Monitoring" });
+                    ui.colored_label(
+                        if paused { p.warn } else { p.accent },
+                        if paused {
+                            "○ Paused"
+                        } else {
+                            "● Monitoring"
+                        },
+                    );
                 }
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(8.0);
-                match self.page {
-                    Page::Dashboard => self.show_dashboard(ui),
-                    Page::History => self.show_history(ui),
-                    Page::Favorites => self.show_favorites(ui),
-                    Page::Snippets => self.show_snippets(ui),
-                    Page::Search => self.show_search(ui),
-                    Page::Activity => self.show_activity(ui),
-                    Page::Settings => self.show_settings(ui),
-                }
+            ui::paint_gradient_background(ui);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("ClipVault").font(ui::heading_font(16.0)));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.monospace(format!("v{}", env!("CARGO_PKG_VERSION")));
+                    let paused = PAUSED.load(Ordering::Relaxed);
+                    ui.colored_label(
+                        if paused { p.warn } else { p.accent },
+                        if paused {
+                            "○ Paused"
+                        } else {
+                            "● Monitoring"
+                        },
+                    );
+                });
             });
-            if let Some((text, kind, _)) = &self.toast {
-                ui::toast(ui, text, *kind);
-            }
+            ui.add_space(4.0);
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.scope(|ui| {
+                    ui.set_opacity(fade);
+                    ui.add_space(8.0);
+                    match self.page {
+                        Page::Dashboard => self.show_dashboard(ui),
+                        Page::History => self.show_history(ui),
+                        Page::Favorites => self.show_favorites(ui),
+                        Page::Snippets => self.show_snippets(ui),
+                        Page::Search => self.show_search(ui),
+                        Page::Activity => self.show_activity(ui),
+                        Page::Settings => self.show_settings(ui),
+                    }
+                });
+            });
         });
 
-        if !self.settings.reduced_motion {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        // Animated toast, bottom-right: slides in, fades out after 4s.
+        if let Some((text, kind, since)) = &self.toast {
+            let age = since.elapsed().as_secs_f32();
+            if age > 4.0 {
+                self.toast = None;
+            } else {
+                let alpha = if age < 0.2 {
+                    crate::animation::ease_out_cubic(age / 0.2)
+                } else if age > 3.5 {
+                    1.0 - (age - 3.5) / 0.5
+                } else {
+                    1.0
+                };
+                let slide = if reduced {
+                    0.0
+                } else {
+                    (1.0 - crate::animation::ease_out_cubic(age / 0.25)) * 20.0
+                };
+                let text = text.clone();
+                let kind = *kind;
+                egui::Area::new("toast".into())
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0 + slide))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.set_opacity(alpha.clamp(0.0, 1.0));
+                        ui::toast(ui, &text, kind);
+                    });
+            }
+        }
+
+        // Repaint only while something is still moving.
+        let sidebar_moving = (sidebar_width - sidebar_target).abs() > 0.5;
+        let animating = sidebar_moving || fade < 1.0 || self.toast.is_some();
+        if animating {
+            ctx.request_repaint();
         }
     }
 }
@@ -208,18 +299,19 @@ impl ClipVaultApp {
         let bytes = self.store.total_bytes().unwrap_or(0);
         let favorites = self.store.list_favorites().map(|v| v.len()).unwrap_or(0);
         ui.horizontal(|ui| {
-            ui.label(format!("Items stored: {}", count));
-            ui.label(format!("Storage used: {}", format_bytes(bytes)));
-            ui.label(format!("Pinned or favorite: {}", favorites));
+            ui::stat_card(ui, "Items stored", &count.to_string());
+            ui::stat_card(ui, "Storage used", &format_bytes(bytes));
+            ui::stat_card(ui, "Pinned or favorite", &favorites.to_string());
         });
         ui.add_space(12.0);
         if platform::wayland_limited() {
-            ui.colored_label(ui::palette().danger, "Wayland detected: persistent clipboard capture is limited on Wayland. History may miss items copied while ClipVault is not the clipboard owner.");
+            ui.colored_label(ui::palette().warn, "Wayland detected: persistent clipboard capture is limited on Wayland. History may miss items copied while ClipVault is not the clipboard owner.");
         }
         ui.add_space(8.0);
         ui.label(platform::clipboard_backend_note());
         ui.add_space(16.0);
-        ui.heading("Recent items");
+        ui.label(egui::RichText::new("Recent items").font(ui::heading_font(18.0)));
+        ui.add_space(6.0);
         match self.store.list_items(8, 0) {
             Ok(items) if items.is_empty() => {
                 ui.label(
@@ -227,8 +319,8 @@ impl ClipVaultApp {
                 );
             }
             Ok(items) => {
-                for item in items {
-                    self.item_row(ui, &item);
+                for (i, item) in items.iter().enumerate() {
+                    self.item_row(ui, item, i);
                 }
             }
             Err(e) => {
@@ -240,36 +332,45 @@ impl ClipVaultApp {
         }
     }
 
-    fn item_row(&mut self, ui: &mut egui::Ui, item: &crate::storage::Item) {
+    fn item_row(&mut self, ui: &mut egui::Ui, item: &crate::storage::Item, index: usize) {
         let p = ui::palette();
-        egui::Frame::new()
-            .fill(p.panel_alt)
-            .stroke(egui::Stroke::new(1.0f32, p.border))
-            .corner_radius(6)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
+        // Staggered entrance: each card fades in a beat after the one above
+        // it, driven by the page fade.
+        let fade = self.page_fade();
+        let alpha =
+            crate::animation::ease_out_cubic((fade * 1.4 - index as f32 * 0.08).clamp(0.0, 1.0));
+        ui.scope(|ui| {
+            ui.set_opacity(alpha);
+            ui::card_frame(&p).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("#{}  {}", item.id, item.kind.as_str()));
+                    ui.monospace(format!("#{}  {}", item.id, item.kind.as_str()));
                     if item.pinned {
-                        ui.colored_label(p.accent, "Pinned");
+                        ui.colored_label(p.accent, "● Pinned");
                     }
                     if item.favorite {
-                        ui.colored_label(p.accent, "Favorite");
+                        ui.colored_label(p.accent, "★ Favorite");
                     }
                     if item.sensitive {
                         ui.colored_label(p.danger, "Sensitive");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format_time(item.created_at));
+                        ui.monospace(format_time(item.created_at));
                     });
                 });
+                ui.add_space(4.0);
                 ui.label(&item.preview);
                 if !item.tags.is_empty() {
-                    ui.label(format!("Tags: {}", item.tags.join(", ")));
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!("Tags: {}", item.tags.join(", ")))
+                            .small()
+                            .color(p.text_dim),
+                    );
                 }
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     let id = item.id;
-                    if ui.button("Copy back").clicked() {
+                    if ui::primary_button(ui, "Copy back").clicked() {
                         match restore_to_clipboard(&self.store, id) {
                             Ok(msg) => self.set_toast(msg, ToastKind::Ok),
                             Err(e) => self.set_toast(e, ToastKind::Error),
@@ -300,7 +401,8 @@ impl ClipVaultApp {
                     }
                 });
             });
-        ui.add_space(6.0);
+        });
+        ui.add_space(8.0);
     }
 
     fn show_history(&mut self, ui: &mut egui::Ui) {
@@ -309,7 +411,7 @@ impl ClipVaultApp {
             ui.label("Filter:");
             ui.text_edit_singleline(&mut self.history_filter);
             if ui.button("Refresh").clicked() {
-                self.page_anim = 0.0;
+                self.page_started = std::time::Instant::now();
             }
         });
         ui.add_space(8.0);
@@ -328,8 +430,8 @@ impl ClipVaultApp {
                 if items.is_empty() {
                     ui.label("No items match. Copy something, or clear the filter.");
                 }
-                for item in items {
-                    self.item_row(ui, &item);
+                for (i, item) in items.iter().enumerate() {
+                    self.item_row(ui, item, i);
                 }
             }
             Err(e) => {
@@ -366,8 +468,8 @@ impl ClipVaultApp {
                 ui.label("No favorites yet. Pin or favorite an item from History and it will show up here.");
             }
             Ok(items) => {
-                for item in items {
-                    self.item_row(ui, &item);
+                for (i, item) in items.iter().enumerate() {
+                    self.item_row(ui, item, i);
                 }
             }
             Err(e) => {
@@ -413,8 +515,8 @@ impl ClipVaultApp {
         ui.heading("Pinned snippets");
         match self.store.list_favorites() {
             Ok(items) => {
-                for item in items.into_iter().filter(|i| i.pinned) {
-                    self.item_row(ui, &item);
+                for (i, item) in items.into_iter().filter(|i| i.pinned).enumerate() {
+                    self.item_row(ui, &item, i);
                 }
             }
             Err(e) => {
@@ -432,7 +534,7 @@ impl ClipVaultApp {
             ui.label("Search:");
             ui.text_edit_singleline(&mut self.search_query);
             if ui.button("Search").clicked() {
-                self.page_anim = 0.0;
+                self.page_started = std::time::Instant::now();
             }
         });
         ui.add_space(8.0);
@@ -446,8 +548,8 @@ impl ClipVaultApp {
             }
             Ok(items) => {
                 ui.label(format!("{} result(s).", items.len()));
-                for item in items {
-                    self.item_row(ui, &item);
+                for (i, item) in items.iter().enumerate() {
+                    self.item_row(ui, item, i);
                 }
             }
             Err(e) => {
